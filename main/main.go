@@ -99,6 +99,7 @@ func main() {
 	router.POST("/createEscrow", handleCreateEscrow)
 	router.POST("/approvePayout", handleApprovePayout)
 	router.POST("/disapprove", handleDisapprove)
+	router.GET("/getSellerContracts", handleGetSellerContracts)
 	router.Run(":3000")
 }
 
@@ -347,6 +348,70 @@ func handleApprovePayout(c *gin.Context) {
 	// Check for PayoutRequested event
 	defer checkForPayoutRequestedEvent(contractAddress, client, receipt.BlockNumber)
 	c.JSON(http.StatusOK, gin.H{"status": "payout approved", "transactionHash": tx.Hash().Hex()})
+}
+
+func handleGetSellerContracts(c *gin.Context) {
+	sellerAddress := os.Getenv("SELLER_ADDRESS")
+	if sellerAddress == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "SELLER_ADDRESS not set in environment"})
+		return
+	}
+
+	seller := common.HexToAddress(sellerAddress)
+
+	// Get the latest block number
+	latestBlock, err := client.BlockNumber(context.Background())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get latest block number"})
+		return
+	}
+
+	// Get contracts
+	contracts, err := getEscrowContracts(client, nil, &seller, nil, 0, big.NewInt(int64(latestBlock)))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get seller contracts"})
+		return
+	}
+
+	// Collect contract info
+	var contractInfos []gin.H
+	for _, contractAddress := range contracts {
+		instance, err := NewMain(contractAddress, client)
+		if err != nil {
+			continue // Skip this contract if we can't instantiate it
+		}
+
+		buyer, _ := instance.Buyer(&bind.CallOpts{})
+		seller, _ := instance.Seller(&bind.CallOpts{})
+		trustee, _ := instance.Trustee(&bind.CallOpts{})
+		amount, _ := instance.AmountINR(&bind.CallOpts{})
+		state, _ := instance.CurrentState(&bind.CallOpts{})
+
+		// Convert state to string based on its value
+		var stateStr string
+		switch state {
+		case 0:
+			stateStr = "Active"
+		case 1:
+			stateStr = "Completed"
+		default:
+			stateStr = fmt.Sprintf("Unknown (%d)", state)
+		}
+
+		contractInfos = append(contractInfos, gin.H{
+			"address": contractAddress.Hex(),
+			"buyer":   buyer.Hex(),
+			"seller":  seller.Hex(),
+			"trustee": trustee.Hex(),
+			"amount":  amount.String(),
+			"state":   stateStr,
+		})
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"sellerAddress": sellerAddress,
+		"contracts":     contractInfos,
+	})
 }
 
 func handleDisapprove(c *gin.Context) {
@@ -621,4 +686,46 @@ func completeContract(contractAddress common.Address, auth *bind.TransactOpts, c
 
 	log.Println("Contract successfully marked as completed")
 	return nil
+}
+
+func getEscrowContracts(client *ethclient.Client, buyerAddress, sellerAddress, trusteeAddress *common.Address, fromBlock uint64, toBlock *big.Int) ([]common.Address, error) {
+	escrowCreatedSig := []byte("EscrowCreated(address,address,address,uint256)")
+	escrowCreatedTopic := crypto.Keccak256Hash(escrowCreatedSig)
+
+	query := ethereum.FilterQuery{
+		FromBlock: big.NewInt(int64(fromBlock)),
+		ToBlock:   toBlock,
+		Topics:    [][]common.Hash{{escrowCreatedTopic}},
+	}
+
+	// Add buyer filter if provided
+	if buyerAddress != nil {
+		query.Topics = append(query.Topics, []common.Hash{common.BytesToHash(buyerAddress.Bytes())})
+	} else {
+		query.Topics = append(query.Topics, nil)
+	}
+
+	// Add seller filter if provided
+	if sellerAddress != nil {
+		query.Topics = append(query.Topics, []common.Hash{common.BytesToHash(sellerAddress.Bytes())})
+	} else {
+		query.Topics = append(query.Topics, nil)
+	}
+
+	// Add trustee filter if provided
+	if trusteeAddress != nil {
+		query.Topics = append(query.Topics, []common.Hash{common.BytesToHash(trusteeAddress.Bytes())})
+	}
+
+	logs, err := client.FilterLogs(context.Background(), query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to filter logs: %v", err)
+	}
+
+	var contractAddresses []common.Address
+	for _, vLog := range logs {
+		contractAddresses = append(contractAddresses, vLog.Address)
+	}
+
+	return contractAddresses, nil
 }

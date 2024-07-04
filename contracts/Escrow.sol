@@ -58,6 +58,13 @@ contract Escrow {
         _;
     }
 
+    event EscrowCreated(
+        address indexed buyer,
+        address indexed seller,
+        address indexed trustee,
+        uint256 amountINR
+    );
+
     constructor(
         address _buyer,
         address _seller,
@@ -75,6 +82,8 @@ contract Escrow {
         sellerBankDetails = _sellerBankDetails;
         payoutAuth = _payoutAuth;
         currentState = State.Active;
+
+        emit EscrowCreated(_buyer, _seller, _trustee, _amountINR);
     }
 
     function approveByBuyer() public onlyActive {
