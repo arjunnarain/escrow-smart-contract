@@ -7,6 +7,9 @@ contract Escrow {
     address public trustee;
     uint256 public amountINR;
 
+    enum State { Active, Completed }
+    State public currentState;
+
     struct BankDetails {
         string accountHolderName;
         string accountNumber;
@@ -29,7 +32,31 @@ contract Escrow {
     bool public trusteeApproval;
 
     event ApprovalReceived(address indexed approver);
-    event PayoutRequested(string buyerAccount, string sellerAccount, uint256 amountINR);
+    event PayoutRequested(
+        string buyerAccountHolderName,
+        string buyerAccountNumber,
+        string buyerBankName,
+        string buyerIfscCode,
+        string sellerAccountHolderName,
+        string sellerAccountNumber,
+        string sellerBankName,
+        string sellerIfscCode,
+        uint256 amountINR
+    );
+    event ContractCompleted();
+
+    modifier onlyActive() {
+        require(currentState == State.Active, "Contract is no longer active");
+        _;
+    }
+
+    modifier canComplete() {
+        require(
+            msg.sender == trustee,
+            "Only trustee can complete the contract"
+        );
+        _;
+    }
 
     constructor(
         address _buyer,
@@ -47,36 +74,37 @@ contract Escrow {
         buyerBankDetails = _buyerBankDetails;
         sellerBankDetails = _sellerBankDetails;
         payoutAuth = _payoutAuth;
+        currentState = State.Active;
     }
 
-    function approveByBuyer() public {
+    function approveByBuyer() public onlyActive {
         require(msg.sender == buyer, "Only buyer can approve");
         buyerApproval = true;
         emit ApprovalReceived(msg.sender);
         checkAndRequestPayout();
     }
 
-    function approveBySeller() public {
-        require(msg.sender == seller);
+    function approveBySeller() public onlyActive {
+        require(msg.sender == seller, "Only seller can approve");
         sellerApproval = true;
         emit ApprovalReceived(msg.sender);
         checkAndRequestPayout();
     }
 
-    function approveByTrustee() public {
+    function approveByTrustee() public onlyActive {
         require(msg.sender == trustee, "Only trustee can approve");
         trusteeApproval = true;
         emit ApprovalReceived(msg.sender);
         checkAndRequestPayout();
     }
 
-    function disapproveByBuyer() public {
+    function disapproveByBuyer() public onlyActive {
         require(msg.sender == buyer, "Only buyer can disapprove");
         buyerApproval = false;
         emit ApprovalReceived(msg.sender);
     }
 
-    function disapproveBySeller() public {
+    function disapproveBySeller() public onlyActive {
         require(msg.sender == seller, "Only seller can disapprove");
         sellerApproval = false;
         emit ApprovalReceived(msg.sender);
@@ -84,7 +112,22 @@ contract Escrow {
 
     function checkAndRequestPayout() internal {
         if ((buyerApproval && sellerApproval) || (trusteeApproval && (buyerApproval || sellerApproval))) {
-            emit PayoutRequested(buyerBankDetails.accountNumber, sellerBankDetails.accountNumber, amountINR);
+            emit PayoutRequested(
+                buyerBankDetails.accountHolderName,
+                buyerBankDetails.accountNumber,
+                buyerBankDetails.bankName,
+                buyerBankDetails.ifscCode,
+                sellerBankDetails.accountHolderName,
+                sellerBankDetails.accountNumber,
+                sellerBankDetails.bankName,
+                sellerBankDetails.ifscCode,
+                amountINR
+            );
         }
+    }
+
+    function completeContract() public onlyActive canComplete {
+        currentState = State.Completed;
+        emit ContractCompleted();
     }
 }
