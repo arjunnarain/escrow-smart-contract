@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ecdsa"
 	"fmt"
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -37,6 +38,7 @@ type CreateEscrowRequest struct {
 type ApproveRequest struct {
 	ContractAddress string `json:"contractAddress"`
 	Role            string `json:"role"`
+	PrivateKey      string `json:"privateKey"`
 }
 
 func main() {
@@ -156,7 +158,7 @@ func handleCreateEscrow(c *gin.Context) {
 	log.Printf("Transaction hash: %s", tx.Hash().Hex())
 
 	// Store the contract address
-	lastDeployedContractAddress = common.HexToAddress("0xc6c6bc6c907c9b71fb3d23151a0321de7ff81d4ef24eddc1d52749109b2a272d")
+	lastDeployedContractAddress = common.HexToAddress("0xAeDC40bf670996912bc3E2e7a9592984eC78467e")
 	// Verify the deployed contract
 	err = verifyEscrowContract(lastDeployedContractAddress)
 	if err != nil {
@@ -231,6 +233,14 @@ func handleApprovePayout(c *gin.Context) {
 		return
 	}
 
+	// Convert the private key from string to ecdsa.PrivateKey
+	privateKey, err := crypto.HexToECDSA(approveRequest.PrivateKey)
+	if err != nil {
+		log.Printf("Failed to load private key: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid private key"})
+		return
+	}
+
 	chainID, err := client.ChainID(context.Background())
 	if err != nil {
 		log.Printf("Failed to get chain ID: %v", err)
@@ -274,6 +284,16 @@ func handleApprovePayout(c *gin.Context) {
 
 	log.Printf("Approval transaction hash: %s", tx.Hash().Hex())
 
+	// Wait for the transaction to be mined
+	receipt, err := bind.WaitMined(context.Background(), client, tx)
+	if err != nil {
+		log.Printf("Failed to wait for transaction to be mined: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to confirm approval"})
+		return
+	}
+
+	// Check for PayoutRequested event
+	defer checkForPayoutRequestedEvent(contractAddress, client, receipt.BlockNumber)
 	c.JSON(http.StatusOK, gin.H{"status": "payout approved", "transactionHash": tx.Hash().Hex()})
 }
 
@@ -282,6 +302,12 @@ func handleDisapprove(c *gin.Context) {
 	if err := c.ShouldBindJSON(&disapproveRequest); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+
+	// Convert the private key from string to ecdsa.PrivateKey
+	privateKey, err := crypto.HexToECDSA(disapproveRequest.PrivateKey)
+	if err != nil {
+		log.Fatalf("Failed to load private key: %v", err)
 	}
 
 	chainID, err := client.ChainID(context.Background())
@@ -326,4 +352,80 @@ func handleDisapprove(c *gin.Context) {
 	log.Printf("Disapproval transaction hash: %s", tx.Hash().Hex())
 
 	c.JSON(http.StatusOK, gin.H{"status": "disapproval registered", "transactionHash": tx.Hash().Hex()})
+}
+
+func checkForPayoutRequestedEvent(contractAddress common.Address, client *ethclient.Client, fromBlock *big.Int) error {
+	instance, err := NewMain(contractAddress, client)
+	if err != nil {
+		return fmt.Errorf("failed to instantiate contract: %v", err)
+	}
+
+	query := ethereum.FilterQuery{
+		Addresses: []common.Address{contractAddress},
+		FromBlock: fromBlock,
+		ToBlock:   nil, // nil means the latest block
+	}
+
+	logs, err := client.FilterLogs(context.Background(), query)
+	if err != nil {
+		return fmt.Errorf("failed to filter logs: %v", err)
+	}
+
+	for _, vLog := range logs {
+		event, err := instance.ParsePayoutRequested(vLog)
+		if err != nil {
+			log.Printf("Failed to parse PayoutRequested event: %v", err)
+			continue
+		}
+
+		log.Printf("PayoutRequested event received!")
+		log.Printf("Buyer Account: %s", event.BuyerAccount)
+		log.Printf("Seller Account: %s", event.SellerAccount)
+		log.Printf("Amount INR: %s", event.AmountINR.String())
+
+		processPayout(event.BuyerAccount, event.SellerAccount, event.AmountINR)
+	}
+
+	return nil
+}
+
+func processPayout(buyerAccount, sellerAccount string, amountINR *big.Int) {
+	log.Printf("Processing payout: From %s to %s, Amount: %s INR", buyerAccount, sellerAccount, amountINR.String())
+
+	// Convert big.Int to float64 for Razorpay
+	//amountFloat := new(big.Float).SetInt(amountINR)
+	//amount, _ := amountFloat.Float64()
+
+	// Initialize Razorpay client
+	// client := razorpay.NewClient(os.Getenv("RAZORPAY_KEY_ID"), os.Getenv("RAZORPAY_SECRET_KEY"))
+
+	//data := map[string]interface{}{
+	//	"account_number": sellerAccount,
+	//	"amount":         amount * 100, // Razorpay expects amount in paise
+	//	"currency":       "INR",
+	//	"mode":           "IMPS",
+	//	"purpose":        "payout",
+	//	"queue_if_low_balance": true,
+	//	"reference_id":   fmt.Sprintf("order_%s", amountINR.String()),
+	//	"narration":      "Escrow Payout",
+	//}
+
+	//body, err := client.Payout.Create(data, nil)
+	//if err != nil {
+	//	log.Printf("Failed to create payout: %v", err)
+	//	// Here you might want to implement retry logic or notify an admin
+	//	return
+	//}
+
+	log.Printf("Payout successful. Payout ID")
+
+	// You might want to update your database or the smart contract here to record the successful payout
+	//updatePayoutStatus(buyerAccount, sellerAccount, body["id"].(string))
+}
+
+func updatePayoutStatus(buyerAccount, sellerAccount, payoutID string) {
+	// This function would update your database or smart contract with the payout status
+	// Implementation depends on your specific requirements
+	log.Printf("Updating payout status for buyer %s, seller %s, payout ID %s", buyerAccount, sellerAccount, payoutID)
+	// Add your implementation here
 }

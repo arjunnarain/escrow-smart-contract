@@ -3,9 +3,9 @@
 const Escrow = artifacts.require("Escrow");
 
 module.exports = function (deployer) {
-    const buyer = "0x2e0DdfC6Cd122571729b2B4063abF9320cdf112e";
-    const seller = "0xB11d4E637cC1D9bB4ec3b1C8F828CA5Ee8574dce";
-    const trustee = "0x913870a5C637F815dEf4dFC3eD38ed0667Db62bE";
+    const buyer = "0xe1621A94B849b994D9317635682B017D7aeAcEfb";
+    const seller = "0x4a821D1155802cEF86C5d93445caa10f16D35569";
+    const trustee = "0x66E40344870447841Ea02C35596F1C5669F08c3A";
     const amountINR = web3.utils.toWei("1", "ether"); // Adjust the amount as needed
     const buyerBank = {
         accountHolderName: "Buyer Name",

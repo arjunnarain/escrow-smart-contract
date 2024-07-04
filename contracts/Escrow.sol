@@ -57,7 +57,7 @@ contract Escrow {
     }
 
     function approveBySeller() public {
-        require(msg.sender == seller, "Only seller can approve");
+        require(msg.sender == seller);
         sellerApproval = true;
         emit ApprovalReceived(msg.sender);
         checkAndRequestPayout();
