@@ -13,8 +13,8 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
-	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
+	"github.com/julienschmidt/httprouter"
 	"io/ioutil"
 	"log"
 	"math/big"
@@ -48,6 +48,8 @@ type ApproveRequest struct {
 	Role            string `json:"role"`
 	PrivateKey      string `json:"buyerPrivateKey"`
 }
+
+var finalContractAddress common.Address
 
 func main() {
 	err := godotenv.Load()
@@ -95,12 +97,24 @@ func main() {
 		log.Fatalf("Failed to load private key: %v", err)
 	}
 
-	router := gin.Default()
+	router := httprouter.New()
+
+	//Apply the CORS middleware
+	router.GlobalOPTIONS = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+		w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Authorization")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	})
+
 	router.POST("/createEscrow", handleCreateEscrow)
 	router.POST("/approvePayout", handleApprovePayout)
 	router.POST("/disapprove", handleDisapprove)
 	router.GET("/getSellerContracts", handleGetSellerContracts)
-	router.Run(":3000")
+	router.GET("/getBuyerContracts", handleGetBuyerContracts)
+
+	log.Fatal(http.ListenAndServe(":3000", router))
 }
 
 func getEnv(key, fallback string) string {
@@ -140,10 +154,16 @@ func updateEnvFile(key, value, filePath string) error {
 	return nil
 }
 
-func handleCreateEscrow(c *gin.Context) {
+func enableCors(w *http.ResponseWriter) {
+	(*w).Header().Set("Access-Control-Allow-Origin", "*")
+}
+
+func handleCreateEscrow(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 	var createRequest CreateEscrowRequest
-	if err := c.ShouldBindJSON(&createRequest); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+
+	//enableCors(&w)
+	if err := json.NewDecoder(r.Body).Decode(&createRequest); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -154,7 +174,7 @@ func handleCreateEscrow(c *gin.Context) {
 	err := cmd.Run()
 	if err != nil {
 		log.Printf("Failed to deploy contract: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to deploy contract"})
+		http.Error(w, "Failed to deploy contract", http.StatusInternalServerError)
 		return
 	}
 
@@ -163,7 +183,7 @@ func handleCreateEscrow(c *gin.Context) {
 	matches := re.FindStringSubmatch(out.String())
 	if len(matches) < 2 {
 		log.Printf("Failed to find contract address in truffle output")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to deploy contract"})
+		http.Error(w, "Failed to deploy contract", http.StatusInternalServerError)
 		return
 	}
 
@@ -174,15 +194,16 @@ func handleCreateEscrow(c *gin.Context) {
 	err = updateEnvFile("CONTRACT_ADDRESS", contractAddress, ".env")
 	if err != nil {
 		log.Printf("Failed to update .env file: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update .env file"})
+		http.Error(w, "Failed to update .env file", http.StatusInternalServerError)
 		return
 	}
 
 	// Load the updated contract address
-	lastDeployedContractAddress, err := loadUpdatedContractAddress()
+	lastDeployedContractAddress := common.HexToAddress(contractAddress)
+	finalContractAddress = lastDeployedContractAddress
 	if err != nil {
 		log.Printf(err.Error())
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	log.Printf("Updated contract address: %s", lastDeployedContractAddress.Hex())
@@ -191,32 +212,22 @@ func handleCreateEscrow(c *gin.Context) {
 	err = verifyEscrowContract(lastDeployedContractAddress)
 	if err != nil {
 		log.Printf("Contract verification failed: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Contract verification failed"})
+		http.Error(w, "Contract verification failed", http.StatusInternalServerError)
 		return
 	}
 
 	log.Printf("Contract verified successfully")
 
-	c.JSON(http.StatusOK, gin.H{
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
 		"status":          "escrow contract deployed and verified",
-		"contractAddress": lastDeployedContractAddress,
+		"contractAddress": lastDeployedContractAddress.Hex(),
 	})
 }
 
 func loadUpdatedContractAddress() (common.Address, error) {
-	// Reload the .env file to fetch the updated contract address
-	err := godotenv.Load(".env")
-	if err != nil {
-		return common.Address{}, fmt.Errorf("failed to reload .env file: %v", err)
-	}
-
-	// Fetch the updated contract address
-	updatedContractAddress := getEnv("CONTRACT_ADDRESS", "")
-	if updatedContractAddress == "" {
-		return common.Address{}, fmt.Errorf("failed to fetch updated contract address from .env file")
-	}
-
-	return common.HexToAddress(updatedContractAddress), nil
+	return finalContractAddress, nil
 }
 
 func verifyEscrowContract(contractAddress common.Address) error {
@@ -252,36 +263,24 @@ func verifyEscrowContract(contractAddress common.Address) error {
 	return nil
 }
 
-func logDeploymentDetails(auth *bind.TransactOpts, buyer, seller, trustee common.Address, amountINR *big.Int) {
-	log.Printf("Deployment details:")
-	log.Printf("From: %s", auth.From.Hex())
-	log.Printf("Buyer: %s", buyer.Hex())
-	log.Printf("Seller: %s", seller.Hex())
-	log.Printf("Trustee: %s", trustee.Hex())
-	log.Printf("Amount INR: %s", amountINR.String())
-	log.Printf("Gas Price: %s", auth.GasPrice.String())
-	log.Printf("Gas Limit: %d", auth.GasLimit)
-	log.Printf("Nonce: %d", auth.Nonce.Uint64())
-}
-
-func handleApprovePayout(c *gin.Context) {
+func handleApprovePayout(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 	var approveRequest ApproveRequest
-	if err := c.ShouldBindJSON(&approveRequest); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	if err := json.NewDecoder(r.Body).Decode(&approveRequest); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	chainID, err := client.ChainID(context.Background())
 	if err != nil {
 		log.Printf("Failed to get chain ID: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get chain ID"})
+		http.Error(w, "Failed to get chain ID", http.StatusInternalServerError)
 		return
 	}
 
 	contractAddress, err := loadUpdatedContractAddress()
 	if err != nil {
 		log.Printf(err.Error())
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	log.Printf("Updated contract address: %s", lastDeployedContractAddress)
@@ -289,7 +288,7 @@ func handleApprovePayout(c *gin.Context) {
 	instance, err := NewMain(contractAddress, client)
 	if err != nil {
 		log.Printf("Failed to instantiate contract: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to instantiate contract"})
+		http.Error(w, "Failed to instantiate contract", http.StatusInternalServerError)
 		return
 	}
 
@@ -299,7 +298,7 @@ func handleApprovePayout(c *gin.Context) {
 		auth, err := bind.NewKeyedTransactorWithChainID(buyerPrivateKey, chainID)
 		if err != nil {
 			log.Printf("Failed to create transactor: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create transactor"})
+			http.Error(w, "Failed to create transactor", http.StatusInternalServerError)
 			return
 		}
 		tx, err = instance.ApproveByBuyer(auth)
@@ -307,7 +306,7 @@ func handleApprovePayout(c *gin.Context) {
 		auth, err := bind.NewKeyedTransactorWithChainID(sellerPrivateKey, chainID)
 		if err != nil {
 			log.Printf("Failed to create transactor: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create transactor"})
+			http.Error(w, "Failed to create transactor", http.StatusInternalServerError)
 			return
 		}
 		tx, err = instance.ApproveBySeller(auth)
@@ -315,23 +314,23 @@ func handleApprovePayout(c *gin.Context) {
 		auth, err := bind.NewKeyedTransactorWithChainID(trusteePrivateKey, chainID)
 		if err != nil {
 			log.Printf("Failed to create transactor: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create transactor"})
+			http.Error(w, "Failed to create transactor", http.StatusInternalServerError)
 			return
 		}
 		tx, err = instance.ApproveByTrustee(auth)
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role"})
+		http.Error(w, "invalid role", http.StatusBadRequest)
 		return
 	}
 
 	if err != nil {
 		log.Printf("Failed to approve payout: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to approve payout"})
+		http.Error(w, "Failed to approve payout", http.StatusInternalServerError)
 		return
 	}
 
 	if tx == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Contract is completed already."})
+		http.Error(w, "Contract is completed already.", http.StatusInternalServerError)
 		return
 	}
 
@@ -341,19 +340,21 @@ func handleApprovePayout(c *gin.Context) {
 	receipt, err := bind.WaitMined(context.Background(), client, tx)
 	if err != nil {
 		log.Printf("Failed to wait for transaction to be mined: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to confirm approval"})
+		http.Error(w, "Failed to confirm approval", http.StatusInternalServerError)
 		return
 	}
 
 	// Check for PayoutRequested event
 	defer checkForPayoutRequestedEvent(contractAddress, client, receipt.BlockNumber)
-	c.JSON(http.StatusOK, gin.H{"status": "payout approved", "transactionHash": tx.Hash().Hex()})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "payout approved", "transactionHash": tx.Hash().Hex()})
 }
 
-func handleGetSellerContracts(c *gin.Context) {
+func handleGetSellerContracts(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 	sellerAddress := os.Getenv("SELLER_ADDRESS")
 	if sellerAddress == "" {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "SELLER_ADDRESS not set in environment"})
+		http.Error(w, "SELLER_ADDRESS not set in environment", http.StatusInternalServerError)
 		return
 	}
 
@@ -362,19 +363,19 @@ func handleGetSellerContracts(c *gin.Context) {
 	// Get the latest block number
 	latestBlock, err := client.BlockNumber(context.Background())
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get latest block number"})
+		http.Error(w, "Failed to get latest block number", http.StatusInternalServerError)
 		return
 	}
 
 	// Get contracts
 	contracts, err := getEscrowContracts(client, nil, &seller, nil, 0, big.NewInt(int64(latestBlock)))
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get seller contracts"})
+		http.Error(w, "Failed to get seller contracts", http.StatusInternalServerError)
 		return
 	}
 
 	// Collect contract info
-	var contractInfos []gin.H
+	var contractInfos []map[string]string
 	for _, contractAddress := range contracts {
 		instance, err := NewMain(contractAddress, client)
 		if err != nil {
@@ -398,7 +399,7 @@ func handleGetSellerContracts(c *gin.Context) {
 			stateStr = fmt.Sprintf("Unknown (%d)", state)
 		}
 
-		contractInfos = append(contractInfos, gin.H{
+		contractInfos = append(contractInfos, map[string]string{
 			"address": contractAddress.Hex(),
 			"buyer":   buyer.Hex(),
 			"seller":  seller.Hex(),
@@ -408,30 +409,98 @@ func handleGetSellerContracts(c *gin.Context) {
 		})
 	}
 
-	c.JSON(http.StatusOK, gin.H{
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
 		"sellerAddress": sellerAddress,
 		"contracts":     contractInfos,
 	})
 }
 
-func handleDisapprove(c *gin.Context) {
+func handleGetBuyerContracts(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+	buyerAddress := os.Getenv("BUYER_ADDRESS")
+	if buyerAddress == "" {
+		http.Error(w, "BUYER_ADDRESS not set in environment", http.StatusInternalServerError)
+		return
+	}
+
+	buyer := common.HexToAddress(buyerAddress)
+
+	// Get the latest block number
+	latestBlock, err := client.BlockNumber(context.Background())
+	if err != nil {
+		http.Error(w, "Failed to get latest block number", http.StatusInternalServerError)
+		return
+	}
+
+	// Get contracts
+	contracts, err := getEscrowContracts(client, &buyer, nil, nil, 0, big.NewInt(int64(latestBlock)))
+	if err != nil {
+		http.Error(w, "Failed to get seller contracts", http.StatusInternalServerError)
+		return
+	}
+
+	// Collect contract info
+	var contractInfos []map[string]string
+	for _, contractAddress := range contracts {
+		instance, err := NewMain(contractAddress, client)
+		if err != nil {
+			continue // Skip this contract if we can't instantiate it
+		}
+
+		buyer, _ := instance.Buyer(&bind.CallOpts{})
+		seller, _ := instance.Seller(&bind.CallOpts{})
+		trustee, _ := instance.Trustee(&bind.CallOpts{})
+		amount, _ := instance.AmountINR(&bind.CallOpts{})
+		state, _ := instance.CurrentState(&bind.CallOpts{})
+
+		// Convert state to string based on its value
+		var stateStr string
+		switch state {
+		case 0:
+			stateStr = "Active"
+		case 1:
+			stateStr = "Completed"
+		default:
+			stateStr = fmt.Sprintf("Unknown (%d)", state)
+		}
+
+		contractInfos = append(contractInfos, map[string]string{
+			"address": contractAddress.Hex(),
+			"buyer":   buyer.Hex(),
+			"seller":  seller.Hex(),
+			"trustee": trustee.Hex(),
+			"amount":  amount.String(),
+			"state":   stateStr,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"buyerAddress": buyerAddress,
+		"contracts":    contractInfos,
+	})
+}
+
+func handleDisapprove(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 	var disapproveRequest ApproveRequest
-	if err := c.ShouldBindJSON(&disapproveRequest); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	if err := json.NewDecoder(r.Body).Decode(&disapproveRequest); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	chainID, err := client.ChainID(context.Background())
 	if err != nil {
 		log.Printf("Failed to get chain ID: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get chain ID"})
+		http.Error(w, "Failed to get chain ID", http.StatusInternalServerError)
 		return
 	}
 
 	contractAddress, err := loadUpdatedContractAddress()
 	if err != nil {
 		log.Printf(err.Error())
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	log.Printf("Updated contract address: %s", lastDeployedContractAddress.Hex())
@@ -439,7 +508,7 @@ func handleDisapprove(c *gin.Context) {
 	instance, err := NewMain(contractAddress, client)
 	if err != nil {
 		log.Printf("Failed to instantiate contract: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to instantiate contract"})
+		http.Error(w, "Failed to instantiate contract", http.StatusInternalServerError)
 		return
 	}
 
@@ -449,7 +518,7 @@ func handleDisapprove(c *gin.Context) {
 		auth, err := bind.NewKeyedTransactorWithChainID(buyerPrivateKey, chainID)
 		if err != nil {
 			log.Printf("Failed to create transactor: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create transactor"})
+			http.Error(w, "Failed to create transactor", http.StatusInternalServerError)
 			return
 		}
 		tx, err = instance.DisapproveByBuyer(auth)
@@ -457,24 +526,26 @@ func handleDisapprove(c *gin.Context) {
 		auth, err := bind.NewKeyedTransactorWithChainID(sellerPrivateKey, chainID)
 		if err != nil {
 			log.Printf("Failed to create transactor: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create transactor"})
+			http.Error(w, "Failed to create transactor", http.StatusInternalServerError)
 			return
 		}
 		tx, err = instance.DisapproveBySeller(auth)
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid role"})
+		http.Error(w, "invalid role", http.StatusBadRequest)
 		return
 	}
 
 	if err != nil {
 		log.Printf("Failed to disapprove: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to disapprove"})
+		http.Error(w, "Failed to disapprove", http.StatusInternalServerError)
 		return
 	}
 
 	log.Printf("Disapproval transaction hash: %s", tx.Hash().Hex())
 
-	c.JSON(http.StatusOK, gin.H{"status": "disapproval registered", "transactionHash": tx.Hash().Hex()})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "disapproval registered", "transactionHash": tx.Hash().Hex()})
 }
 
 func checkForPayoutRequestedEvent(contractAddress common.Address, client *ethclient.Client, fromBlock *big.Int) error {
